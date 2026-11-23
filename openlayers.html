@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>US population density – OpenLayers</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/ol@10.11.0/ol.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;700&family=Fraunces:ital,wght@0,600;1,600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="map"></div>
+
+<!-- Same banner as the Leaflet version -->
+<div class="card">
+  <div class="title-block">
+    <h1>Population density of the United States of America</h1>
+    <div class="byline">Webmap by Pamela Lira</div>
+  </div>
+  <div class="legend-block">
+    <div class="legend-title">People / mi²</div>
+    <div class="legend-bar" id="legend-bar"></div>
+    <div class="legend-ticks" id="legend-ticks"></div>
+  </div>
+  <div class="legend-city"><span class="dot"></span> City</div>
+  <div class="readout" id="readout"></div>
+</div>
+
+<!-- Popup element (OpenLayers has no built-in popup: it is an Overlay) -->
+<div id="popup" class="ol-paper-popup"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/ol@10.11.0/dist/ol.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/proj4@2.15.0/dist/proj4.js"></script>
+<script src="stateData.js"></script>
+<script>
+  // ---------- 1. Same palette + breaks
+  const BREAKS = [0, 10, 20, 50, 100, 200, 500, 1000];
+  const COLORS = ['#FFF3D6', '#F9D98C', '#F2B544', '#E8892B',
+                  '#CC5A1E', '#A23B17', '#722414', '#4A1A0E'];
+  function getColor(d) {
+    for (let i = BREAKS.length - 1; i >= 0; i--) if (d >= BREAKS[i]) return COLORS[i];
+    return COLORS[0];
+  }
+  // OpenLayers has no separate fill-opacity: put the 0.85 into the colour itself
+  function withAlpha(hex, a) {
+    const n = parseInt(hex.slice(1), 16);
+    return `rgba(${n >> 16}, ${(n >> 8) & 255}, ${n & 255}, ${a})`;
+  }
+
+  document.getElementById('legend-bar').innerHTML = COLORS.map(c => `<span style="background:${c}"></span>`).join('');
+  document.getElementById('legend-ticks').innerHTML = BREAKS.map((b, i) => `<span>${i === BREAKS.length - 1 ? b + '+' : b}</span>`).join('');
+
+  const readout = document.getElementById('readout');
+  function updateReadout(p) {
+    readout.innerHTML = p
+      ? `<div class="state">${p.name}</div><div class="value"><b>${Number(p.density).toLocaleString('en-US')}</b> people / mi²</div>`
+      : '';
+  }
+  updateReadout();
+
+  // ---------- 2. Projection: Albers Equal Area (EPSG:5070), the standard for US thematic maps
+  // Leaflet is fixed to Web Mercator, which inflates northern states. OpenLayers takes any projection
+  // proj4 can define, and re-projects both the vector data and the Web Mercator basemap tiles.
+  proj4.defs('EPSG:5070', '+proj=aea +lat_0=23 +lon_0=-96 +lat_1=29.5 +lat_2=45.5 +x_0=0 +y_0=0 +datum=NAD83 +units=m +no_defs +type=crs');
+  ol.proj.proj4.register(proj4);
+  const PROJ = 'EPSG:5070';
+  ol.proj.get(PROJ).setExtent([-3000000, -500000, 3200000, 4000000]);
+  const toMap = lonLat => ol.proj.fromLonLat(lonLat, PROJ);
+
+  // ---------- 3. Basemap: Esri Light Gray Canvas (no key), re-projected on the fly
+  const ESRI = 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/';
+  const basemap = new ol.layer.Tile({
+    className: 'warm-base',                             // own canvas, so the CSS filter only hits the basemap
+    source: new ol.source.XYZ({
+      url: ESRI + 'World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}', maxZoom: 16,
+      attributions: 'Tiles &copy; Esri &mdash; Esri, DeLorme, NAVTEQ'
+    })
+  });
+
+  // State labels (all 48 + DC) drawn as native OpenLayers text, above the choropleth
+  const labelFeatures = [];
+  STATE_LABELS.forEach(s => {
+    const callout = s.tlng !== undefined;
+    if (callout) labelFeatures.push(new ol.Feature({ kind: 'line',
+      geometry: new ol.geom.LineString([toMap([s.lng, s.lat]), toMap([s.tlng, s.tlat])]) }));
+    labelFeatures.push(new ol.Feature({ kind: 'text', text: s.text, dark: s.dark, callout,
+      geometry: new ol.geom.Point(toMap(callout ? [s.tlng, s.tlat] : [s.lng, s.lat])) }));
+  });
+  const lineStyle = new ol.style.Style({ stroke: new ol.style.Stroke({ color: '#3B2A1E', width: 0.8 }) });
+  const labels = new ol.layer.Vector({
+    zIndex: 10,
+    source: new ol.source.Vector({ features: labelFeatures }),
+    style: f => f.get('kind') === 'line' ? lineStyle : new ol.style.Style({
+      text: new ol.style.Text({
+        text: f.get('text'), font: '700 10.5px "DM Sans", Arial, sans-serif',
+        textAlign: f.get('callout') ? 'left' : 'center', offsetX: f.get('callout') ? 3 : 0,
+        fill: new ol.style.Fill({ color: f.get('dark') && !f.get('callout') ? '#FBF6EC' : '#3B2A1E' }),
+        stroke: new ol.style.Stroke({ color: f.get('dark') && !f.get('callout') ? 'rgba(40, 20, 10, 0.75)' : '#FBF6EC', width: 3 })
+      })
+    })
+  });
+
+  // ---------- 4. Choropleth
+  const stateStyleCache = {};
+  const states = new ol.layer.Vector({
+    zIndex: 5,
+    source: new ol.source.Vector({ features: new ol.format.GeoJSON().readFeatures(statesData, { featureProjection: PROJ }) }),
+    style: f => {
+      const c = getColor(f.get('density'));
+      return stateStyleCache[c] ||= new ol.style.Style({
+        fill: new ol.style.Fill({ color: withAlpha(c, 0.85) }),
+        stroke: new ol.style.Stroke({ color: '#FBF6EC', width: 1 })
+      });
+    }
+  });
+
+  // hover outline is drawn on its own layer, so it sits on top of every state
+  const highlight = new ol.layer.Vector({
+    zIndex: 6,
+    source: new ol.source.Vector(),
+    style: new ol.style.Style({ stroke: new ol.style.Stroke({ color: '#3B2A1E', width: 3 }) })
+  });
+
+  // ---------- 5. New York and San Francisco (labels are native OL text, no extra markers)
+  const cityList = [
+    { name: 'New York', lng: -74.0060, lat: 40.7128, note: 'Most populous US city', dir: 'bottom' },
+    { name: 'San Francisco', lng: -122.4194, lat: 37.7749, note: 'Bay Area, California', dir: 'left' }
+  ];
+  const cities = new ol.layer.Vector({
+    zIndex: 20,
+    source: new ol.source.Vector({
+      features: cityList.map(c => new ol.Feature({ geometry: new ol.geom.Point(toMap([c.lng, c.lat])), ...c }))
+    }),
+    style: f => new ol.style.Style({
+      image: new ol.style.Circle({
+        radius: 6,
+        fill: new ol.style.Fill({ color: '#2F4F2F' }),
+        stroke: new ol.style.Stroke({ color: '#ffffff', width: 2 })
+      }),
+      text: new ol.style.Text({
+        text: f.get('name'), font: '700 12px "DM Sans", Arial, sans-serif',
+        textAlign: f.get('dir') === 'left' ? 'right' : 'center',
+        offsetX: f.get('dir') === 'left' ? -10 : 0, offsetY: f.get('dir') === 'left' ? 0 : 16,
+        fill: new ol.style.Fill({ color: '#2F4F2F' }),
+        stroke: new ol.style.Stroke({ color: '#ffffff', width: 3 })
+      })
+    })
+  });
+
+  // ---------- 6. Map in Albers: zoom bottom right, no rotation, attribution always open
+  const popupEl = document.getElementById('popup');
+  const popup = new ol.Overlay({ element: popupEl, positioning: 'bottom-center', offset: [0, -14], autoPan: { animation: { duration: 250 } } });
+
+  const map = new ol.Map({
+    target: 'map',
+    layers: [basemap, states, highlight, labels, cities],
+    overlays: [popup],
+    controls: ol.control.defaults.defaults({ zoom: false, rotate: false, attributionOptions: { collapsible: false } })
+      .extend([new ol.control.Zoom({ className: 'ol-zoom paper-zoom' })]),
+    interactions: ol.interaction.defaults.defaults({ altShiftDragRotate: false, pinchRotate: false }),
+    view: new ol.View({ projection: PROJ })
+  });
+
+  // fit to the lower 48, leaving room for the banner on top: [top, right, bottom, left]
+  // (16 = sample along the edges, because parallels are curved in Albers)
+  const US = ol.proj.transformExtent([-125, 24.5, -66.9, 49.5], 'EPSG:4326', PROJ, 16);
+  map.getView().fit(US, { padding: [130, 20, 20, 20] });
+
+  // ---------- 7. Hover
+  map.on('pointermove', e => {
+    if (e.dragging) return;
+    const f = map.forEachFeatureAtPixel(e.pixel, f => f, { layerFilter: l => l === states || l === cities });
+    map.getTargetElement().style.cursor = f ? 'pointer' : '';
+    const state = f && f.get('density') !== undefined ? f : null;
+    highlight.getSource().clear();
+    if (state) highlight.getSource().addFeature(state);
+    updateReadout(state ? state.getProperties() : null);
+  });
+
+  // ---------- 8. Click a city -> popup; click anywhere else -> close
+  map.on('singleclick', e => {
+    const f = map.forEachFeatureAtPixel(e.pixel, f => f, { layerFilter: l => l === cities });
+    if (f) {
+      popupEl.innerHTML = `<div class="popup-title">${f.get('name')}</div>${f.get('note')}`;
+      popup.setPosition(f.getGeometry().getCoordinates());
+    } else {
+      popup.setPosition(undefined);
+    }
+  });
+</script>
+</body>
+</html>
